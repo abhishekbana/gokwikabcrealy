@@ -1,0 +1,14 @@
+version: "3.8"
+
+services:
+  abcrelay:
+    build: .
+    container_name: abcrelay
+    restart: unless-stopped
+    ports:
+      - "5555:8080"
+    env_file:
+      - .env
+    volumes:
+      - ./storage:/data/storage
+      - ./logs:/data/logs

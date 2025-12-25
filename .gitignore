@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+
+# Docker
+.env
+*.log
+
+# Runtime data (DO NOT COMMIT)
+storage/
+logs/
+
+# OS / Editor
+.DS_Store
+.vscode/
+.idea/
+

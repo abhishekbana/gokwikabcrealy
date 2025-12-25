@@ -55,7 +55,9 @@ def ingest():
             "tags": ["source:gokwik", "intent:abandoned-cart"],
             "cart_url": cart.get("abc_url"),
             "cart_value": cart.get("total_price"),
-            "drop_stage": cart.get("drop_stage")
+            "drop_stage": cart.get("drop_stage"),
+            # IMPORTANT: reset coupon flag for every abandoned cart
+            "abc_cupon5_sent": False
         }
 
         mautic_resp = requests.post(

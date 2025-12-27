@@ -57,7 +57,10 @@ def ingest():
             "cart_value": cart.get("total_price"),
             "drop_stage": cart.get("drop_stage"),
             # IMPORTANT: reset coupon flag for every abandoned cart
-            "abc_cupon5_sent": False
+            "abc_cupon5_sent": False,
+            "abc1": False,
+            "abc2": False,
+            "abc3": False
         }
 
         mautic_resp = requests.post(

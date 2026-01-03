@@ -3,6 +3,9 @@ import os, json, uuid, datetime, requests
 
 app = Flask(__name__)
 
+# -------------------------------------------------------------------
+# Environment / Paths
+# -------------------------------------------------------------------
 DATA_DIR = os.getenv("DATA_DIR", "/data/storage")
 LOG_FILE = os.getenv("LOG_FILE", "/data/logs/relay.log")
 
@@ -18,45 +21,59 @@ os.makedirs(INCOMING, exist_ok=True)
 os.makedirs(FORWARDED, exist_ok=True)
 os.makedirs(ERRORS, exist_ok=True)
 
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
 def log(msg):
     with open(LOG_FILE, "a") as f:
         f.write(f"{datetime.datetime.utcnow().isoformat()} | {msg}\n")
 
+def log_ok(email, source):
+    log(f"OK | {source} | {email}")
+
+def log_error(error):
+    log(f"ERROR | {error}")
+
+def store_payload(payload, folder):
+    ts = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    fid = f"{ts}-{uuid.uuid4().hex}"
+    path = f"{DATA_DIR}/{folder}/{fid}.json"
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+def mautic_upsert(payload):
+    resp = requests.post(
+        f"{MAUTIC_URL}/api/contacts/new",
+        auth=(MAUTIC_USER, MAUTIC_PASS),
+        json=payload,
+        timeout=10
+    )
+    if resp.status_code not in (200, 201):
+        raise Exception(resp.text)
+
 def extract_products(order):
     items = order.get("line_items", [])
-
-    product_names = []
-    categories = set()
+    names = []
 
     for item in items:
         name = item.get("name")
         if name:
-            product_names.append(name)
+            names.append(name)
 
-        # If category exists in meta (optional)
-        for meta in item.get("meta_data", []):
-            if meta.get("key") == "category":
-                categories.add(meta.get("value"))
+    return ", ".join(names)
 
-    return {
-        "last_product_names": ", ".join(product_names),
-        "last_product_category": list(categories)[0] if categories else None
-    }
-
+# -------------------------------------------------------------------
+# GoKwik – Abandoned Cart Endpoint
+# -------------------------------------------------------------------
 @app.route("/", methods=["POST"])
-def ingest():
+def gokwik_ingest():
     payload = request.json
-    ts = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-    fid = f"{ts}-{uuid.uuid4().hex}"
-
-    raw_path = f"{INCOMING}/{fid}.json"
-    with open(raw_path, "w") as f:
-        json.dump(payload, f, indent=2)
+    store_payload(payload, "incoming")
 
     try:
         carts = payload.get("carts", [])
         if not carts:
-            raise ValueError("No carts in payload")
+            raise Exception("No carts in payload")
 
         cart = carts[0]
         customer = cart.get("customer", {})
@@ -65,55 +82,51 @@ def ingest():
         phone = customer.get("phone")
 
         if not email:
-            raise ValueError("Missing email")
+            raise Exception("Missing email")
 
         contact = {
             "email": email,
             "firstname": customer.get("firstname", ""),
             "lastname": customer.get("lastname", ""),
             "mobile": phone,
+
             "lead_source": "gokwik",
-            "tags": ["source:gokwik", "intent:abandoned-cart"],
+
             "cart_url": cart.get("abc_url"),
             "cart_value": cart.get("total_price"),
+            "tags": ["source:gokwik", "intent:abandoned-cart"],
             "drop_stage": cart.get("drop_stage"),
-            # IMPORTANT: reset coupon flag for every abandoned cart
+
+            "last_abandoned_cart_date": datetime.datetime.utcnow().isoformat(),
+
+            # IMPORTANT: reset coupon flag on every abandon
             "abc_cupon5_sent": False,
             "abc1": False,
             "abc2": False,
             "abc3": False
         }
 
-        mautic_resp = requests.post(
-            f"{MAUTIC_URL}/api/contacts/new",
-            auth=(MAUTIC_USER, MAUTIC_PASS),
-            json=contact,
-            timeout=10
-        )
+        mautic_upsert(contact)
+        store_payload(contact, "forwarded")
+        log_ok(email, "gokwik")
 
-        if mautic_resp.status_code not in (200, 201):
-            raise Exception(mautic_resp.text)
-
-        with open(f"{FORWARDED}/{fid}.json", "w") as f:
-            json.dump(contact, f, indent=2)
-
-        log(f"OK | {email}")
         return jsonify({"status": "ok"}), 200
 
     except Exception as e:
-        with open(f"{ERRORS}/{fid}.json", "w") as f:
-            json.dump(payload, f, indent=2)
-        log(f"ERROR | {str(e)}")
+        store_payload(payload, "errors")
+        log_error(str(e))
         return jsonify({"error": str(e)}), 400
 
+# -------------------------------------------------------------------
+# WooCommerce – Order Update Endpoint
+# -------------------------------------------------------------------
 @app.route("/woocommerce", methods=["POST"])
 def woocommerce_webhook():
     data = request.json
+    store_payload(data, "incoming")
 
     try:
         status = data.get("status")
-
-        # Only process paid / completed orders
         if status not in ["processing", "completed"]:
             return jsonify({"ignored_status": status}), 200
 
@@ -124,47 +137,46 @@ def woocommerce_webhook():
         if not email:
             raise Exception("No email in WooCommerce payload")
 
-        order_id = data.get("id")
-        total = data.get("total")
         order_date = data.get("date_created_gmt")
 
-        products = extract_products(data)
-
         mautic_payload = {
+            "last_order_id": str(data.get("id")),
             "email": email,
             "mobile": phone,
 
-            # Purchase markers
             "has_purchased": True,
             "last_order_date": order_date,
 
-            # Set only once logic handled by Mautic (or optional relay check)
-            "first_order_date": order_date,
+            "last_product_names": extract_products(data),
 
-            # Commerce intelligence
-            "last_product_names": products["last_product_names"],
-            "last_product_category": products["last_product_category"],
-
-            # Location
             "city": billing.get("city"),
             "state": billing.get("state"),
             "pincode": billing.get("postcode"),
 
-            # Attribution
-            "lead_source": "woocommerce"
+            "lead_source": "woocommerce",
+            "tags": ["source:website", "type:website-customer"],
+
+            # Safe to send — Mautic will keep first value
+            "first_order_date": order_date,
+            "abc_cupon5_sent": True,
+            "abc1": True,
+            "abc2": True,
+            "abc3": True
         }
 
         mautic_upsert(mautic_payload)
-
+        store_payload(mautic_payload, "forwarded")
         log_ok(email, "woocommerce")
-        store_payload(data, "forwarded")
 
         return jsonify({"status": "order synced"}), 200
 
     except Exception as e:
-        log_error(str(e), data)
         store_payload(data, "errors")
+        log_error(str(e))
         return jsonify({"error": str(e)}), 400
 
+# -------------------------------------------------------------------
+# Run
+# -------------------------------------------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)

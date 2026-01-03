@@ -150,7 +150,7 @@ def woocommerce_webhook():
             "last_product_names": extract_products(data),
 
             "city": billing.get("city"),
-            "state": billing.get("state"),
+            # "state": billing.get("state"),
             "pincode": billing.get("postcode"),
 
             "lead_source": "woocommerce",

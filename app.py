@@ -22,6 +22,27 @@ def log(msg):
     with open(LOG_FILE, "a") as f:
         f.write(f"{datetime.datetime.utcnow().isoformat()} | {msg}\n")
 
+def extract_products(order):
+    items = order.get("line_items", [])
+
+    product_names = []
+    categories = set()
+
+    for item in items:
+        name = item.get("name")
+        if name:
+            product_names.append(name)
+
+        # If category exists in meta (optional)
+        for meta in item.get("meta_data", []):
+            if meta.get("key") == "category":
+                categories.add(meta.get("value"))
+
+    return {
+        "last_product_names": ", ".join(product_names),
+        "last_product_category": list(categories)[0] if categories else None
+    }
+
 @app.route("/", methods=["POST"])
 def ingest():
     payload = request.json
@@ -83,6 +104,66 @@ def ingest():
         with open(f"{ERRORS}/{fid}.json", "w") as f:
             json.dump(payload, f, indent=2)
         log(f"ERROR | {str(e)}")
+        return jsonify({"error": str(e)}), 400
+
+@app.route("/woocommerce", methods=["POST"])
+def woocommerce_webhook():
+    data = request.json
+
+    try:
+        status = data.get("status")
+
+        # Only process paid / completed orders
+        if status not in ["processing", "completed"]:
+            return jsonify({"ignored_status": status}), 200
+
+        billing = data.get("billing", {})
+        email = billing.get("email")
+        phone = billing.get("phone")
+
+        if not email:
+            raise Exception("No email in WooCommerce payload")
+
+        order_id = data.get("id")
+        total = data.get("total")
+        order_date = data.get("date_created_gmt")
+
+        products = extract_products(data)
+
+        mautic_payload = {
+            "email": email,
+            "mobile": phone,
+
+            # Purchase markers
+            "has_purchased": True,
+            "last_order_date": order_date,
+
+            # Set only once logic handled by Mautic (or optional relay check)
+            "first_order_date": order_date,
+
+            # Commerce intelligence
+            "last_product_names": products["last_product_names"],
+            "last_product_category": products["last_product_category"],
+
+            # Location
+            "city": billing.get("city"),
+            "state": billing.get("state"),
+            "pincode": billing.get("postcode"),
+
+            # Attribution
+            "lead_source": "woocommerce"
+        }
+
+        mautic_upsert(mautic_payload)
+
+        log_ok(email, "woocommerce")
+        store_payload(data, "forwarded")
+
+        return jsonify({"status": "order synced"}), 200
+
+    except Exception as e:
+        log_error(str(e), data)
+        store_payload(data, "errors")
         return jsonify({"error": str(e)}), 400
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ __pycache__/
 # Runtime data (DO NOT COMMIT)
 storage/
 logs/
+rough.txt
 
 # OS / Editor
 .DS_Store

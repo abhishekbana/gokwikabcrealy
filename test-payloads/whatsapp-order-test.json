@@ -1,0 +1,26 @@
+{
+  "id": 5551,
+  "status": "processing",
+  "currency": "INR",
+  "total": "500",
+  "payment_method": "cod",
+  "date_created": "2025-12-31T10:30:00",
+  "date_created_gmt": "2025-12-31T05:00:00",
+  "billing": {
+    "first_name": "Abhishek",
+    "last_name": "Bana",
+    "email": "abhi.bana@gmail.com",
+    "phone": "9483160505",
+    "city": "Bengaluru",
+    "postcode": "560001"
+  },
+  "line_items": [
+    {
+      "id": 101,
+      "name": "40W Mono Solar Panel",
+      "quantity": 1,
+      "total": "500"
+    }
+  ]
+}
+

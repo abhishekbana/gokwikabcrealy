@@ -129,15 +129,13 @@ def send_whatsapp_order_processing(order):
             "variables_values": variables,
         }
 
-        from urllib.parse import urlencode
-        raw_url = f"{FAST2SMS_WHATSAPP_URL}?{urlencode(payload)}"
-        logger.info("WhatsApp RAW URL | %s", raw_url)
+        # Logs raw URL for debugging
+        # from urllib.parse import urlencode
+        # raw_url = f"{FAST2SMS_WHATSAPP_URL}?{urlencode(payload)}"
+        # logger.info("WhatsApp RAW URL | %s", raw_url)
 
-        # response = requests.post(
-        #     FAST2SMS_WHATSAPP_URL, data=payload, timeout=10
-        # )
+        # Authorization key is needed in headers, not in data
         headers = {"authorization": FAST2SMS_API_KEY}
-
         payload_no_auth = payload.copy()
         payload_no_auth.pop("authorization", None)
         response = requests.post(

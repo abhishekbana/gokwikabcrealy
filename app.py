@@ -38,7 +38,8 @@ MAUTIC_PASS = os.getenv("MAUTIC_PASS")
 FAST2SMS_API_KEY = os.getenv("FAST2SMS_API_KEY")
 
 FAST2SMS_WHATSAPP_URL = "https://www.fast2sms.com/dev/whatsapp"
-MESSAGE_ID = "10360"
+MESSAGE_ID_ORDER_RECEIVED = "10360"
+MESSAGE_ID_ORDER_SHIPPED = "10363"
 PHONE_NUMBER_ID = "978701858655665"
 
 INCOMING = f"{DATA_DIR}/incoming"
@@ -77,13 +78,23 @@ def extract_products(order):
     return ", ".join(names)
 
 
-def whatsapp_already_sent(order_id):
+def whatsapp_processing_already_sent(order_id):
     return os.path.exists(f"{WHATSAPP_SENT}/order_{order_id}.flag")
 
 
-def mark_whatsapp_sent(order_id):
+def mark_whatsapp_processing_sent(order_id):
     with open(f"{WHATSAPP_SENT}/order_{order_id}.flag", "w") as f:
         f.write(datetime.utcnow().isoformat())
+
+
+def whatsapp_shipped_already_sent(order_id):
+    return os.path.exists(f"{WHATSAPP_SENT}/order_{order_id}_shipped.flag")
+
+
+def mark_whatsapp_shipped_sent(order_id):
+    with open(f"{WHATSAPP_SENT}/order_{order_id}_shipped.flag", "w") as f:
+        f.write(datetime.utcnow().isoformat())
+
 
 
 # -------------------------------------------------------------------
@@ -92,7 +103,7 @@ def mark_whatsapp_sent(order_id):
 def send_whatsapp_order_processing(order):
     order_id = str(order.get("id"))
 
-    if whatsapp_already_sent(order_id):
+    if whatsapp_processing_already_sent(order_id):
         logger.info(f"WhatsApp skipped | Already sent | Order {order_id}")
         return {"status": "skipped", "reason": "duplicate"}
 
@@ -123,7 +134,7 @@ def send_whatsapp_order_processing(order):
 
         payload = {
             "authorization": FAST2SMS_API_KEY,
-            "message_id": MESSAGE_ID,
+            "message_id": MESSAGE_ID_ORDER_RECEIVED,
             "phone_number_id": PHONE_NUMBER_ID,
             "numbers": mobile,
             "variables_values": variables,
@@ -147,7 +158,7 @@ def send_whatsapp_order_processing(order):
 
         if response.status_code == 200:
             logger.info(f"WhatsApp sent | Order {order_id} | {mobile}")
-            mark_whatsapp_sent(order_id)
+            mark_whatsapp_processing_sent(order_id)
         else:
             logger.error(
                 f"WhatsApp FAILED | Order {order_id} | "
@@ -160,6 +171,69 @@ def send_whatsapp_order_processing(order):
         logger.exception(f"WhatsApp ERROR | Order {order_id} | {str(e)}")
         return {"status": "error", "message": str(e)}
 
+# -------------------------------------------------------------------
+# WhatsApp – Order Shipped Utility Message
+# -------------------------------------------------------------------
+def send_whatsapp_order_shipped(order):
+    order_id = str(order.get("id"))
+
+    if whatsapp_shipped_already_sent(order_id):
+        logger.info(f"WhatsApp shipped skipped | Already sent | Order {order_id}")
+        return {"status": "skipped", "reason": "duplicate"}
+
+    try:
+        billing = order.get("billing", {})
+        customer_name = billing.get("first_name", "").strip()
+
+        dispatch_date = datetime.utcnow().strftime("%d/%m/%Y")
+
+        mobile = billing.get("phone", "")
+        mobile = "".join(filter(str.isdigit, mobile))[-10:]
+
+        if len(mobile) != 10:
+            logger.warning(
+                f"WhatsApp shipped NOT sent | Invalid mobile | Order {order_id}"
+            )
+            return {"status": "skipped", "reason": "invalid_mobile"}
+
+        variables = "|".join([
+            customer_name,     # Var1
+            order_id,          # Var2
+            dispatch_date      # Var3
+        ])
+
+        headers = {
+            "authorization": FAST2SMS_API_KEY
+        }
+
+        payload = {
+            "message_id": MESSAGE_ID_ORDER_SHIPPED,
+            "phone_number_id": PHONE_NUMBER_ID,
+            "numbers": mobile,
+            "variables_values": variables
+        }
+
+        response = requests.post(
+            FAST2SMS_WHATSAPP_URL,
+            headers=headers,
+            data=payload,
+            timeout=10
+        )
+
+        if response.status_code == 200:
+            logger.info(f"WhatsApp shipped sent | Order {order_id} | {mobile}")
+            mark_whatsapp_shipped_sent(order_id)
+        else:
+            logger.error(
+                f"WhatsApp shipped FAILED | Order {order_id} | "
+                f"{response.status_code} | {response.text}"
+            )
+
+        return response.json()
+
+    except Exception as e:
+        logger.exception(f"WhatsApp shipped ERROR | Order {order_id} | {str(e)}")
+        return {"status": "error", "message": str(e)}
 
 # -------------------------------------------------------------------
 # GoKwik – Abandoned Cart Webhook
@@ -220,7 +294,7 @@ def woocommerce_webhook():
 
     try:
         status = data.get("status")
-        if status not in ["processing", "completed"]:
+        if status not in ["processing", "completed", "shipped"]:
             return jsonify({"ignored_status": status}), 200
 
         billing = data.get("billing", {})
@@ -254,11 +328,22 @@ def woocommerce_webhook():
         store_payload(mautic_payload, "forwarded")
         logger.info(f"Mautic OK | woocommerce | {email}")
 
-        # WhatsApp should NEVER break order sync
-        try:
-            send_whatsapp_order_processing(data)
-        except Exception:
-            logger.error("WhatsApp failed but order sync succeeded")
+        
+        # WhatsApp – Order Processing
+        if status == "processing":
+            try:
+                send_whatsapp_order_processing(data)
+            except Exception:
+                logger.error("WhatsApp processing failed but order sync succeeded")
+
+
+        # WhatsApp – Order Shipped
+        if status in ["completed", "shipped"]:
+            try:
+                send_whatsapp_order_shipped(data)
+            except Exception:
+                logger.error("WhatsApp shipped failed but order sync succeeded")
+
 
         return jsonify({"status": "order synced"}), 200
 

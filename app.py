@@ -1,69 +1,156 @@
 from flask import Flask, request, jsonify
-import os, json, uuid, datetime, requests
+import os
+import json
+import uuid
+import logging
+import requests
+from datetime import datetime
 
+# -------------------------------------------------------------------
+# App & Logging Setup (TOP LEVEL)
+# -------------------------------------------------------------------
 app = Flask(__name__)
 
+LOG_FILE = os.getenv("LOG_FILE", "/data/logs/relay.log")
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+
+logger = logging.getLogger("webhook-relay")
+
+file_handler = logging.FileHandler(LOG_FILE)
+file_handler.setFormatter(
+    logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+)
+logger.addHandler(file_handler)
+
 # -------------------------------------------------------------------
-# Environment / Paths
+# Environment / Configuration
 # -------------------------------------------------------------------
 DATA_DIR = os.getenv("DATA_DIR", "/data/storage")
-LOG_FILE = os.getenv("LOG_FILE", "/data/logs/relay.log")
 
 MAUTIC_URL = os.getenv("MAUTIC_URL")
 MAUTIC_USER = os.getenv("MAUTIC_USER")
 MAUTIC_PASS = os.getenv("MAUTIC_PASS")
+FAST2SMS_API_KEY = os.getenv("FAST2SMS_API_KEY")
+
+FAST2SMS_WHATSAPP_URL = "https://www.fast2sms.com/dev/whatsapp"
+MESSAGE_ID = "10360"
+PHONE_NUMBER_ID = "978701858655665"
 
 INCOMING = f"{DATA_DIR}/incoming"
 FORWARDED = f"{DATA_DIR}/forwarded"
 ERRORS = f"{DATA_DIR}/errors"
+WHATSAPP_SENT = f"{DATA_DIR}/whatsapp_sent"
 
-os.makedirs(INCOMING, exist_ok=True)
-os.makedirs(FORWARDED, exist_ok=True)
-os.makedirs(ERRORS, exist_ok=True)
+for d in (INCOMING, FORWARDED, ERRORS, WHATSAPP_SENT):
+    os.makedirs(d, exist_ok=True)
 
 # -------------------------------------------------------------------
-# Helpers
+# Helper Functions
 # -------------------------------------------------------------------
-def log(msg):
-    with open(LOG_FILE, "a") as f:
-        f.write(f"{datetime.datetime.utcnow().isoformat()} | {msg}\n")
-
-def log_ok(email, source):
-    log(f"OK | {source} | {email}")
-
-def log_error(error):
-    log(f"ERROR | {error}")
-
 def store_payload(payload, folder):
-    ts = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
     fid = f"{ts}-{uuid.uuid4().hex}"
     path = f"{DATA_DIR}/{folder}/{fid}.json"
     with open(path, "w") as f:
         json.dump(payload, f, indent=2)
+
 
 def mautic_upsert(payload):
     resp = requests.post(
         f"{MAUTIC_URL}/api/contacts/new",
         auth=(MAUTIC_USER, MAUTIC_PASS),
         json=payload,
-        timeout=10
+        timeout=10,
     )
     if resp.status_code not in (200, 201):
         raise Exception(resp.text)
 
+
 def extract_products(order):
     items = order.get("line_items", [])
-    names = []
-
-    for item in items:
-        name = item.get("name")
-        if name:
-            names.append(name)
-
+    names = [i.get("name") for i in items if i.get("name")]
     return ", ".join(names)
 
+
+def whatsapp_already_sent(order_id):
+    return os.path.exists(f"{WHATSAPP_SENT}/order_{order_id}.flag")
+
+
+def mark_whatsapp_sent(order_id):
+    with open(f"{WHATSAPP_SENT}/order_{order_id}.flag", "w") as f:
+        f.write(datetime.utcnow().isoformat())
+
+
 # -------------------------------------------------------------------
-# GoKwik – Abandoned Cart Endpoint
+# WhatsApp – Order Processing Utility Message
+# -------------------------------------------------------------------
+def send_whatsapp_order_processing(order):
+    order_id = str(order.get("id"))
+
+    if whatsapp_already_sent(order_id):
+        logger.info(f"WhatsApp skipped | Already sent | Order {order_id}")
+        return {"status": "skipped", "reason": "duplicate"}
+
+    try:
+        billing = order.get("billing", {})
+
+        customer_name = billing.get("first_name", "").strip()
+        order_date_raw = order.get("date_created")
+        order_date = datetime.fromisoformat(
+            order_date_raw.replace("Z", "")
+        ).strftime("%d/%m/%Y")
+
+        order_value = f"Rs. {int(float(order.get('total', 0))):,}/-"
+        payment_type = "COD" if order.get("payment_method") == "cod" else "Prepaid"
+
+        mobile = billing.get("phone", "")
+        mobile = "".join(filter(str.isdigit, mobile))[-10:]
+
+        if len(mobile) != 10:
+            logger.warning(
+                f"WhatsApp NOT sent | Invalid mobile | Order {order_id} | {mobile}"
+            )
+            return {"status": "skipped", "reason": "invalid_mobile"}
+
+        variables = "|".join(
+            [customer_name, order_id, order_date, order_value, payment_type]
+        )
+
+        payload = {
+            "authorization": FAST2SMS_API_KEY,
+            "message_id": MESSAGE_ID,
+            "phone_number_id": PHONE_NUMBER_ID,
+            "numbers": mobile,
+            "variables_values": variables,
+        }
+
+        response = requests.post(
+            FAST2SMS_WHATSAPP_URL, data=payload, timeout=10
+        )
+
+        if response.status_code == 200:
+            logger.info(f"WhatsApp sent | Order {order_id} | {mobile}")
+            mark_whatsapp_sent(order_id)
+        else:
+            logger.error(
+                f"WhatsApp FAILED | Order {order_id} | "
+                f"{response.status_code} | {response.text}"
+            )
+
+        return response.json()
+
+    except Exception as e:
+        logger.exception(f"WhatsApp ERROR | Order {order_id} | {str(e)}")
+        return {"status": "error", "message": str(e)}
+
+
+# -------------------------------------------------------------------
+# GoKwik – Abandoned Cart Webhook
 # -------------------------------------------------------------------
 @app.route("/", methods=["POST"])
 def gokwik_ingest():
@@ -77,9 +164,7 @@ def gokwik_ingest():
 
         cart = carts[0]
         customer = cart.get("customer", {})
-
         email = customer.get("email")
-        phone = customer.get("phone")
 
         if not email:
             raise Exception("Missing email")
@@ -88,37 +173,33 @@ def gokwik_ingest():
             "email": email,
             "firstname": customer.get("firstname", ""),
             "lastname": customer.get("lastname", ""),
-            "mobile": phone,
-
+            "mobile": customer.get("phone"),
             "lead_source": "gokwik",
-
             "cart_url": cart.get("abc_url"),
             "cart_value": cart.get("total_price"),
-            "tags": ["source:gokwik", "intent:abandoned-cart"],
             "drop_stage": cart.get("drop_stage"),
-
-            "last_abandoned_cart_date": datetime.datetime.utcnow().isoformat(),
-
-            # IMPORTANT: reset coupon flag on every abandon
+            "last_abandoned_cart_date": datetime.utcnow().isoformat(),
+            "tags": ["source:gokwik", "intent:abandoned-cart"],
             "abc_cupon5_sent": False,
             "abc1": False,
             "abc2": False,
-            "abc3": False
+            "abc3": False,
         }
 
         mautic_upsert(contact)
         store_payload(contact, "forwarded")
-        log_ok(email, "gokwik")
+        logger.info(f"Mautic OK | gokwik | {email}")
 
         return jsonify({"status": "ok"}), 200
 
     except Exception as e:
         store_payload(payload, "errors")
-        log_error(str(e))
+        logger.error(f"GoKwik ERROR | {str(e)}")
         return jsonify({"error": str(e)}), 400
 
+
 # -------------------------------------------------------------------
-# WooCommerce – Order Update Endpoint
+# WooCommerce – Order Webhook
 # -------------------------------------------------------------------
 @app.route("/woocommerce", methods=["POST"])
 def woocommerce_webhook():
@@ -140,40 +221,40 @@ def woocommerce_webhook():
         order_date = data.get("date_created_gmt")
 
         mautic_payload = {
-            "last_order_id": str(data.get("id")),
             "email": email,
             "mobile": phone,
-
-            "has_purchased": True,
+            "last_order_id": str(data.get("id")),
             "last_order_date": order_date,
-
+            "first_order_date": order_date,
+            "has_purchased": True,
             "last_product_names": extract_products(data),
-
             "city": billing.get("city"),
-            # "state": billing.get("state"),
             "pincode": billing.get("postcode"),
-
             "lead_source": "woocommerce",
             "tags": ["source:website", "type:website-customer"],
-
-            # Safe to send — Mautic will keep first value
-            "first_order_date": order_date,
             "abc_cupon5_sent": True,
             "abc1": True,
             "abc2": True,
-            "abc3": True
+            "abc3": True,
         }
 
         mautic_upsert(mautic_payload)
         store_payload(mautic_payload, "forwarded")
-        log_ok(email, "woocommerce")
+        logger.info(f"Mautic OK | woocommerce | {email}")
+
+        # WhatsApp should NEVER break order sync
+        try:
+            send_whatsapp_order_processing(data)
+        except Exception:
+            logger.error("WhatsApp failed but order sync succeeded")
 
         return jsonify({"status": "order synced"}), 200
 
     except Exception as e:
         store_payload(data, "errors")
-        log_error(str(e))
+        logger.error(f"WooCommerce ERROR | {str(e)}")
         return jsonify({"error": str(e)}), 400
+
 
 # -------------------------------------------------------------------
 # Run

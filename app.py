@@ -133,8 +133,18 @@ def send_whatsapp_order_processing(order):
         raw_url = f"{FAST2SMS_WHATSAPP_URL}?{urlencode(payload)}"
         logger.info("WhatsApp RAW URL | %s", raw_url)
 
+        # response = requests.post(
+        #     FAST2SMS_WHATSAPP_URL, data=payload, timeout=10
+        # )
+        headers = {"authorization": FAST2SMS_API_KEY}
+
+        payload_no_auth = payload.copy()
+        payload_no_auth.pop("authorization", None)
         response = requests.post(
-            FAST2SMS_WHATSAPP_URL, data=payload, timeout=10
+            FAST2SMS_WHATSAPP_URL,
+            headers=headers,
+            data=payload_no_auth,
+            timeout=10
         )
 
         if response.status_code == 200:
